@@ -18,6 +18,8 @@ import functools
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any, Callable
 
 import google.auth
@@ -40,6 +42,8 @@ from xmanager_cloud.experiment_state_server.proto import work_unit_pb2
 
 _XMANAGER_ENDPOINT = 'dns:///grpc.api.alpha.example.com'
 _CHANNEL_READY_TIMEOUT_SEC = 5.0
+_DEFAULT_TOKEN_LIFETIME_SEC = 3600.0
+_REFRESH_MARGIN_SEC = 300.0
 
 
 def _get_xmanager_endpoint() -> str:
@@ -134,6 +138,108 @@ def get_current_user_email() -> str:
     raise RuntimeError('Failed to get current user email') from e
 
 
+def _get_jwt_expiration(token: str) -> float | None:
+  """Extracts the 'exp' claim from an unverified JWT if present."""
+  try:
+    payload = google_jwt.decode(token, verify=False)
+    if isinstance(payload, dict) and 'exp' in payload:
+      return float(payload['exp'])
+  except Exception:  # pylint: disable=broad-except
+    pass
+  return None
+
+
+class IamIdTokenProvider:
+  """Token provider that fetches and caches Google Cloud IAM OIDC tokens."""
+
+  def __init__(
+      self,
+      client_sa: str,
+      audience: str,
+      refresh_margin_sec: float = _REFRESH_MARGIN_SEC,
+      default_lifetime_sec: float = _DEFAULT_TOKEN_LIFETIME_SEC,
+      time_fn: Callable[[], float] | None = None,
+  ):
+    self._client_sa = client_sa
+    self._audience = audience
+    self._refresh_margin_sec = refresh_margin_sec
+    self._default_lifetime_sec = default_lifetime_sec
+    self._time_fn = time_fn
+    self._cached_token: str | None = None
+    self._expiry_time: float = 0.0
+    self._lock = threading.Lock()
+
+  def _current_time(self) -> float:
+    if self._time_fn is not None:
+      return self._time_fn()
+    return time.time()
+
+  def _is_token_valid(self) -> bool:
+    if not self._cached_token:
+      return False
+    current_time = self._current_time()
+    return current_time < (self._expiry_time - self._refresh_margin_sec)
+
+  def _fetch_token(self) -> tuple[str, float]:
+    try:
+      credentials, _ = google.auth.default()
+      authed_session = google.auth.transport.requests.AuthorizedSession(
+          credentials
+      )
+      url = (
+          'https://iamcredentials.googleapis.com/v1/projects/-/'
+          f'serviceAccounts/{self._client_sa}:generateIdToken'
+      )
+      body = {'audience': self._audience, 'includeEmail': True}
+      response = authed_session.post(url, json=body)
+      response.raise_for_status()
+      token = response.json()['token']
+    except Exception as e:
+      raise RuntimeError('Failed to get identity token via google-auth') from e
+
+    now = self._current_time()
+    jwt_exp = _get_jwt_expiration(token)
+    expiry = (
+        jwt_exp if jwt_exp is not None else (now + self._default_lifetime_sec)
+    )
+    return token, expiry
+
+  def get_token(self) -> str:
+    """Returns a valid ID token, refreshing if expired or expiring soon."""
+    with self._lock:
+      if not self._is_token_valid():
+        token, expiry = self._fetch_token()
+        self._cached_token = token
+        self._expiry_time = expiry
+      assert self._cached_token is not None
+      return self._cached_token
+
+  def __call__(self) -> str:
+    return self.get_token()
+
+
+class AuthMetadataPlugin(grpc.AuthMetadataPlugin):
+  """gRPC AuthMetadataPlugin to dynamically attach fresh bearer auth tokens."""
+
+  def __init__(self, token_provider: Callable[[], str]):
+    super().__init__()
+    self._token_provider = token_provider
+
+  def __call__(
+      self,
+      context: grpc.AuthMetadataContext,
+      callback: grpc.AuthMetadataPluginCallback,
+  ) -> None:
+    try:
+      token = self._token_provider()
+      if token:
+        callback([('authorization', f'Bearer {token}')], None)
+      else:
+        callback([], None)
+    except Exception as e:  # pylint: disable=broad-except
+      callback(None, e)
+
+
 class AuditMetadataInterceptor(grpc.UnaryUnaryClientInterceptor):
   """gRPC client interceptor to audit metadata."""
 
@@ -158,9 +264,23 @@ class AuditMetadataInterceptor(grpc.UnaryUnaryClientInterceptor):
 class BearerAuthInterceptor(grpc.UnaryUnaryClientInterceptor):
   """gRPC client interceptor to inject Authorization Bearer token and user email metadata."""
 
-  def __init__(self, token: str, user_email: str = ''):
-    self._token = token
+  def __init__(
+      self,
+      token: str | None = None,
+      user_email: str = '',
+      token_provider: Callable[[], str] | None = None,
+  ):
+    if token_provider is not None:
+      self._token_provider = token_provider
+    elif token is not None:
+      self._token_provider = lambda: token
+    else:
+      self._token_provider = None
     self._user_email = user_email
+
+  @property
+  def _token(self) -> str | None:
+    return self._token_provider() if self._token_provider else None
 
   def intercept_unary_unary(
       self,
@@ -169,8 +289,10 @@ class BearerAuthInterceptor(grpc.UnaryUnaryClientInterceptor):
       request: Any,
   ) -> Any:
     metadata = list(client_call_details.metadata or [])
-    if self._token:
-      metadata.append(('authorization', f'Bearer {self._token}'))
+    if self._token_provider:
+      token = self._token_provider()
+      if token:
+        metadata.append(('authorization', f'Bearer {token}'))
     if self._user_email:
       metadata.append(('x-goog-user-email', self._user_email))
 
@@ -181,71 +303,36 @@ class BearerAuthInterceptor(grpc.UnaryUnaryClientInterceptor):
 
 def _build_secure_channel(
     endpoint: str,
-    auth_token: str | None,
+    token_provider: Callable[[], str] | None,
     user_email: str,
 ) -> grpc.Channel:
   """Builds a secure TLS gRPC channel with authentication and audit interceptors."""
-  if auth_token:
-    channel_creds = grpc.ssl_channel_credentials()
-    call_creds = grpc.access_token_call_credentials(auth_token)
+  channel_creds = grpc.ssl_channel_credentials()
+  if token_provider:
+    auth_plugin = AuthMetadataPlugin(token_provider)
+    call_creds = grpc.metadata_call_credentials(auth_plugin)
     composite_creds = grpc.composite_channel_credentials(
         channel_creds, call_creds
     )
     channel = grpc.secure_channel(endpoint, composite_creds)
-    interceptor = AuditMetadataInterceptor(user_email)
-    return grpc.intercept_channel(channel, interceptor)
+  else:
+    channel = grpc.secure_channel(endpoint, channel_creds)
 
-  iap_client_id = os.environ.get('IAP_CLIENT_ID')
-  if not iap_client_id:
-    logging.warning(
-        'IAP_CLIENT_ID not set. It should be the OAuth client ID used by IAP '
-        'for your backend.'
-    )
-    iap_client_id = input('Enter IAP_CLIENT_ID: ')
-  client_sa = os.environ.get('XMC_CLIENT_SA')
-  if not client_sa:
-    logging.warning(
-        'XMC_CLIENT_SA not set. It should be the email of the service account '
-        'to impersonate (e.g., '
-        'xmc-client-username@my-project-id.iam.gserviceaccount.com).'
-    )
-    client_sa = input('Enter XMC_CLIENT_SA: ')
-
-  try:
-    credentials, _ = google.auth.default()
-    authed_session = google.auth.transport.requests.AuthorizedSession(
-        credentials
-    )
-    url = (
-        'https://iamcredentials.googleapis.com/v1/projects/-/'
-        f'serviceAccounts/{client_sa}:generateIdToken'
-    )
-    body = {'audience': iap_client_id, 'includeEmail': True}
-    response = authed_session.post(url, json=body)
-    response.raise_for_status()
-    open_id_connect_token = response.json()['token']
-  except Exception as e:
-    raise RuntimeError('Failed to get identity token via google-auth') from e
-
-  channel_creds = grpc.ssl_channel_credentials()
-  call_creds = grpc.access_token_call_credentials(open_id_connect_token)
-  composite_creds = grpc.composite_channel_credentials(
-      channel_creds, call_creds
-  )
-  channel = grpc.secure_channel(endpoint, composite_creds)
-  audit_interceptor = AuditMetadataInterceptor(user_email)
-  return grpc.intercept_channel(channel, audit_interceptor)
+  interceptor = AuditMetadataInterceptor(user_email)
+  return grpc.intercept_channel(channel, interceptor)
 
 
 def _build_insecure_channel(
     endpoint: str,
-    auth_token: str | None,
+    token_provider: Callable[[], str] | None,
     user_email: str,
 ) -> grpc.Channel:
   """Builds an insecure gRPC channel with authentication or audit interceptors."""
   channel = grpc.insecure_channel(endpoint)
-  if auth_token:
-    interceptor = BearerAuthInterceptor(token=auth_token, user_email=user_email)
+  if token_provider:
+    interceptor = BearerAuthInterceptor(
+        token_provider=token_provider, user_email=user_email
+    )
   else:
     interceptor = AuditMetadataInterceptor(user_email)
   return grpc.intercept_channel(channel, interceptor)
@@ -267,10 +354,35 @@ def _create_experiment_state_server_stub(
   auth_token = os.environ.get('XMC_AUTH_TOKEN')
   user_email = get_current_user_email()
 
+  token_provider: Callable[[], str]
+  if auth_token:
+    token_provider = lambda: auth_token
+  else:
+    iap_client_id = os.environ.get('IAP_CLIENT_ID')
+    if not iap_client_id:
+      logging.warning(
+          'IAP_CLIENT_ID not set. It should be the OAuth client ID used by IAP '
+          'for your backend.'
+      )
+      iap_client_id = input('Enter IAP_CLIENT_ID: ')
+    client_sa = os.environ.get('XMC_CLIENT_SA')
+    if not client_sa:
+      logging.warning(
+          'XMC_CLIENT_SA not set. It should be the email of the service account '
+          'to impersonate (e.g., '
+          'xmc-client-username@my-project-id.iam.gserviceaccount.com).'
+      )
+      client_sa = input('Enter XMC_CLIENT_SA: ')
+
+    token_provider = IamIdTokenProvider(
+        client_sa=client_sa,
+        audience=iap_client_id,
+    )
+
   try:
     intercepted_channel = _build_secure_channel(
         endpoint=endpoint,
-        auth_token=auth_token,
+        token_provider=token_provider,
         user_email=user_email,
     )
     grpc.channel_ready_future(intercepted_channel).result(
@@ -289,7 +401,7 @@ def _create_experiment_state_server_stub(
     )
     intercepted_channel = _build_insecure_channel(
         endpoint=endpoint,
-        auth_token=auth_token,
+        token_provider=token_provider,
         user_email=user_email,
     )
     grpc.channel_ready_future(intercepted_channel).result(
