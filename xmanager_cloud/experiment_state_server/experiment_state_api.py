@@ -40,6 +40,10 @@ from xmanager_cloud.experiment_state_server.proto import work_unit_pb2
 
 _XMANAGER_ENDPOINT = 'dns:///grpc.api.alpha.example.com'
 _CHANNEL_READY_TIMEOUT_SEC = 5.0
+# Google Cloud IAM OIDC tokens have a strict maximum lifetime of 3600 seconds
+# (60 minutes). We cache and refresh at 3300 seconds (55 minutes) to provide a
+# 5-minute safety buffer against network latency, clock skew, and in-flight RPCs
+# before the server or Cloud IAP rejects the token as expired.
 _TOKEN_TTL_SEC = 3300.0
 
 
